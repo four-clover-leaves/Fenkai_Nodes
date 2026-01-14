@@ -7,7 +7,7 @@ import re
 from typing import Optional, Tuple, List
 import concurrent.futures
 
-# Import centralized API logic
+# Centralized API logic helper
 try:
     from .api_config import load_gemini_api_key
 except ImportError:
@@ -32,7 +32,7 @@ class FenkaiGeminiNode:
         ratios = ["1:1", "2:1", "16:9", "9:16", "4:3", "3:4", "4:5", "5:4", "3:2", "2:3", "21:9"]
         resolutions = ["1K (Standard)", "2K (High)", "4K (Ultra)"]
 
-        inputs = {
+        return {
             "required": {
                 "prompt": ("STRING", {"default": "Enter prompt here...", "multiline": True}),
                 "model": (models, {"default": "gemini-3-pro-image-preview"}),
@@ -42,13 +42,8 @@ class FenkaiGeminiNode:
                 "single_batch_count": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "max_parallel": ("INT", {"default": 3, "min": 1, "max": 10}), 
             },
-            "optional": {
-                "image_batch": ("IMAGE", {}), # For Batch Image nodes
-            }
+            "optional": {f"image_{i}": ("IMAGE", {}) for i in range(1, 15)}
         }
-        for i in range(1, 15):
-            inputs["optional"][f"image_{i}"] = ("IMAGE", {})
-        return inputs
 
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("images", "prompts_log")
@@ -63,19 +58,20 @@ class FenkaiGeminiNode:
         if pil_image.mode != "RGB": pil_image = pil_image.convert("RGB")
         return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
 
-    def _create_error_image(self, text: str, detail: str = "") -> torch.Tensor:
-        img = Image.new('RGB', (1024, 1024), (0, 0, 0))
+    # FIXED: Now accepts target_size to prevent batch crashes
+    def _create_error_image(self, text: str, size: tuple) -> torch.Tensor:
+        img = Image.new('RGB', size, (0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.text((400, 512), f"{text}: {detail[:20]}", fill=(255, 0, 0))
+        draw.text((size[0]//3, size[1]//2), text, fill=(255, 0, 0))
         return self._pil_to_tensor(img)
 
     def _process_single_prompt(self, index, prompt, model_name, ref_contents, ratio, res_str, target_size):
         try:
             local_client = genai.Client(api_key=self.api_key)
-            contents = ref_contents + [prompt]
+            contents = ref_contents + [prompt] if ref_contents else [prompt]
             
             # API Native Upscaling Hint
-            clean_res = res_str.split(" ")[0] if " " in res_str else None
+            clean_res = res_str.split(" ")[0]
             img_config_args = {"aspect_ratio": ratio}
             if clean_res in ["2K", "4K"]:
                 img_config_args["image_size"] = clean_res
@@ -93,49 +89,37 @@ class FenkaiGeminiNode:
                     if part.inline_data:
                         img = Image.open(BytesIO(part.inline_data.data)).resize(target_size, Image.Resampling.LANCZOS)
                         return (index, self._pil_to_tensor(img), "Success")
-            return (index, self._create_error_image("NO DATA"), "No Data")
+            return (index, self._create_error_image("NO DATA", target_size), "No Data")
         except Exception as e:
-            return (index, self._create_error_image("ERROR", str(e)), str(e))
+            return (index, self._create_error_image("API ERROR", target_size), str(e))
 
-    def generate_image(self, prompt, model, ratio, native_resolution, batch_mode, single_batch_count, max_parallel, image_batch=None, **kwargs):
+    def generate_image(self, prompt, model, ratio, native_resolution, batch_mode, single_batch_count, max_parallel, **kwargs):
         if not self.api_key:
-            return (self._create_error_image("KEY MISSING"), "Setup API_GOOGLE environment variable")
+            return (self._create_error_image("MISSING KEY", (1024, 1024)), "Setup API_GOOGLE")
 
-        # 4K Area Math
+        # RESTORED 4K MULTIPLIER MATH
         mp_multiplier = 1.0
         if "2K" in native_resolution: mp_multiplier = 4.0
         if "4K" in native_resolution: mp_multiplier = 8.0
 
-        ratio_match = re.match(r"^(\d+):(\d+)$", ratio.strip())
+        ratio_match = re.match(r"^(\d+):(\d+)$", ratio)
         rw, rh = map(int, ratio_match.groups()) if ratio_match else (1, 1)
         aspect = rw / rh
         target_w = max(64, int(round(((mp_multiplier * 1024 * 1024) * aspect)**0.5 / 64) * 64))
         target_h = int(target_w / aspect)
 
-        # Context Processing: Single Images prioritized
-        ref_contents = []
-        for i in range(1, 15):
-            img = kwargs.get(f"image_{i}")
-            if img is not None:
-                ref_contents.append(self._tensor_to_pil(img))
-                if len(ref_contents) >= 14: break
-
-        # Fill remaining slots with batch
-        if image_batch is not None and len(ref_contents) < 14:
-            batch_to_add = min(image_batch.shape[0], 14 - len(ref_contents))
-            for i in range(batch_to_add):
-                ref_contents.append(self._tensor_to_pil(image_batch[i]))
-
-        prompts_list = [p.strip() for p in prompt.split('\n') if p.strip()] if batch_mode else [prompt] * single_batch_count
+        prompts = [p.strip() for p in prompt.split('\n') if p.strip()] if batch_mode else [prompt] * single_batch_count
+        ref_contents = [self._tensor_to_pil(kwargs[f"image_{i}"]) for i in range(1, 15) if kwargs.get(f"image_{i}") is not None]
 
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
-            futures = [executor.submit(self._process_single_prompt, i, p, model, ref_contents, ratio, native_resolution, (target_w, target_h)) for i, p in enumerate(prompts_list)]
+            futures = [executor.submit(self._process_single_prompt, i, p, model, ref_contents, ratio, native_resolution, (target_w, target_h)) for i, p in enumerate(prompts)]
             for f in concurrent.futures.as_completed(futures): results.append(f.result())
 
         results.sort(key=lambda x: x[0])
+        # Concatenation will now succeed even if some images are errors
         batch_tensor = torch.cat([r[1] for r in results], dim=0)
-        return (batch_tensor, "\n".join(prompts_list))
+        return (batch_tensor, "\n".join(prompts))
 
 NODE_CLASS_MAPPINGS = {"FenkaiGeminiNode": FenkaiGeminiNode}
 NODE_DISPLAY_NAME_MAPPINGS = {"FenkaiGeminiNode": "FENKAI Nano Banana Pro"}
