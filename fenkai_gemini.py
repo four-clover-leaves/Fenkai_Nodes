@@ -118,9 +118,13 @@ class FenkaiGeminiTextNode:
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE")
         ]
 
+        # FIX: Ensure seed is a 32-bit signed integer for the Gemini API
+        # ComfyUI often provides 64-bit seeds which cause a 400 error.
+        safe_seed = seed % 2147483647
+
         config = types.GenerateContentConfig(
             temperature=temperature,
-            seed=seed,
+            seed=safe_seed,
             thinking_config=thinking_config,
             safety_settings=safety_settings,
             system_instruction=system_instruction
